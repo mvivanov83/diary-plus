@@ -20,6 +20,8 @@ const FLASH_MESSAGES = {
   copied: ['Неделя скопирована на следующую.', 'success'],
   'empty-week': ['В этой неделе нет уроков для копирования.', 'warning'],
   saved: ['Урок сохранён.', 'success'],
+  'saved-on-time': ['Урок сохранён: журнал заполнен вовремя (до 18:00).', 'success'],
+  'saved-late': ['Урок сохранён: журнал заполнен с опозданием (после 18:00).', 'success'],
   'saved-draft': ['Сохранено. Урок ещё не считается заполненным: нужны тема и посещаемость.', 'warning'],
   'file-removed': ['Файл домашнего задания удалён.', 'success'],
   invalid: ['Проверьте заполнение полей.', 'error'],
@@ -29,6 +31,13 @@ const FLASH_MESSAGES = {
   'not-found': ['Запись не найдена.', 'error'],
   'wrong-file': ['Можно загрузить PDF, DOC, DOCX, TXT, PNG, JPG или ZIP до 10 МБ.', 'error'],
   'request-created': ['Заявка отправлена администратору.', 'success'],
+  'request-approved': ['Заявка одобрена, ребёнок привязан к родителю.', 'success'],
+  'request-rejected': ['Заявка отклонена.', 'success'],
+  'request-exists': ['Заявка уже обработана.', 'warning'],
+  'note-saved': ['Внутренняя заметка сохранена.', 'success'],
+  'tokens-saved': ['Токены начислены или списаны.', 'success'],
+  'notifications-read': ['Уведомления отмечены прочитанными.', 'success'],
+  'schedule-changed': ['Расписание изменено, родители получат уведомление.', 'success'],
 };
 
 function roleLabel(role) {

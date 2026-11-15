@@ -52,6 +52,17 @@ function seed(db) {
   const insertToken = db.prepare(
     'INSERT INTO tokens (student_id, teacher_id, amount, reason, created_at) VALUES (?, ?, ?, ?, ?)'
   );
+  const insertPendingUser = db.prepare(`
+    INSERT INTO users (email, password_hash, role, full_name, status)
+    VALUES (?, ?, 'parent', ?, 'pending')
+  `);
+  const insertNotification = db.prepare(`
+    INSERT INTO notifications (parent_id, student_id, kind, title, body, link, created_at, read_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertNote = db.prepare(`
+    INSERT INTO student_notes (student_id, teacher_id, body, created_at) VALUES (?, ?, ?, ?)
+  `);
 
   const run = db.transaction(() => {
     /* ── Пользователи ─────────────────────────────────────────── */
@@ -81,6 +92,9 @@ function seed(db) {
     ).lastInsertRowid;
     const parent4 = insertUser.run(
       'parent4@diary.app', hash.parent, 'parent', 'Смирнова Татьяна Олеговна'
+    ).lastInsertRowid;
+    const pendingParent = insertPendingUser.run(
+      'newparent@diary.app', hash.parent, 'Новикова Елена Андреевна'
     ).lastInsertRowid;
 
     /* ── Предметы ────────────────────────────────────────────── */
@@ -444,13 +458,74 @@ function seed(db) {
 
     /* ── Заявка родителя на модерации ────────────────────────── */
     db.prepare(`
-      INSERT INTO parent_requests (email, full_name, child_name, child_class, status)
-      VALUES (?, ?, ?, ?, 'pending')
+      INSERT INTO parent_requests (email, full_name, child_name, child_class, status, user_id)
+      VALUES (?, ?, ?, ?, 'pending', ?)
     `).run(
       'newparent@diary.app',
       'Новикова Елена Андреевна',
       'Новиков Артём Сергеевич',
-      '6Б'
+      '6Б',
+      pendingParent
+    );
+
+    /* ── Демо-уведомления и внутренняя заметка ───────────────── */
+    const now = Date.now();
+    const hoursAgo = (hours) => new Date(now - hours * 60 * 60 * 1000).toISOString();
+    insertNotification.run(
+      parent1,
+      students['5А'][0],
+      'grade',
+      'Новая оценка: Математика',
+      'Орлов Максим · 5А: 5 за контрольную работу.',
+      `/parent/performance?child=${students['5А'][0]}`,
+      hoursAgo(2),
+      null
+    );
+    insertNotification.run(
+      parent1,
+      students['5А'][0],
+      'homework',
+      'Домашнее задание: Математика',
+      'Орлов Максим · 5А: № 145–148, повторить правила сложения дробей.',
+      `/parent/children/${students['5А'][0]}/diary`,
+      hoursAgo(5),
+      null
+    );
+    insertNotification.run(
+      parent1,
+      students['7В'][0],
+      'token',
+      'Начислено 2 токен(ов)',
+      'Орлова София: активность на уроке.',
+      `/parent/tokens?child=${students['7В'][0]}`,
+      hoursAgo(26),
+      null
+    );
+    insertNotification.run(
+      parent1,
+      students['7В'][0],
+      'schedule',
+      'Расписание: 7В',
+      'Орлова София: изменение в расписании на текущую неделю.',
+      `/parent/children/${students['7В'][0]}/diary`,
+      hoursAgo(50),
+      hoursAgo(48)
+    );
+    insertNotification.run(
+      parent2,
+      students['6Б'][0],
+      'comment',
+      'Комментарий учителя: Русский язык',
+      'Соколов Никита · 6Б: хорошая работа на уроке.',
+      `/parent/children/${students['6Б'][0]}/diary`,
+      hoursAgo(7),
+      null
+    );
+    insertNote.run(
+      students['5А'][0],
+      teacher1,
+      'Сильный ученик, стоит предложить задания повышенной сложности. Родителю не показывать.',
+      hoursAgo(20)
     );
 
     console.log('[diary+] Демо-данные: 3 класса, 30 учеников, 4 учителя, 5 предметов, заявка на модерации.');

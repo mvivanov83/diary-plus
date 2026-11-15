@@ -82,7 +82,7 @@ function sessionMiddleware(req, res, next) {
   const token = parseCookies(req.headers.cookie)[COOKIE_NAME];
   if (token) {
     const row = db.prepare(`
-      SELECT u.id, u.email, u.role, u.full_name
+      SELECT u.id, u.email, u.role, u.full_name, u.status
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = ? AND s.expires_at > ?
@@ -97,6 +97,12 @@ function sessionMiddleware(req, res, next) {
 
   res.locals.user = req.user || null;
   res.locals.currentPath = req.path;
+  res.locals.unread = 0;
+  if (req.user && req.user.role === 'parent') {
+    res.locals.unread = db.prepare(
+      'SELECT COUNT(*) AS count FROM notifications WHERE parent_id = ? AND read_at IS NULL'
+    ).get(req.user.id).count;
+  }
   next();
 }
 

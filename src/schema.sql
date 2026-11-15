@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('admin', 'teacher', 'parent')),
   full_name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'pending', 'rejected')),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS parent_requests (
   child_name TEXT NOT NULL,
   child_class TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   reviewed_at TEXT,
   reviewed_by INTEGER REFERENCES users(id) ON DELETE SET NULL
@@ -132,3 +134,26 @@ CREATE TABLE IF NOT EXISTS tokens (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_tokens_student ON tokens(student_id);
+
+CREATE TABLE IF NOT EXISTS student_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  teacher_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_student_notes_student ON student_notes(student_id, created_at);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('grade', 'homework', 'schedule', 'token', 'comment')),
+  title TEXT NOT NULL,
+  body TEXT,
+  link TEXT,
+  created_at TEXT NOT NULL,
+  read_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_parent ON notifications(parent_id, read_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
