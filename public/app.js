@@ -71,6 +71,59 @@ document.querySelectorAll('.att-option input').forEach((input) => {
   sync();
 });
 
+/* Редактор оценок: кнопки 2–5, несколько нажатий, крестик удаляет */
+document.querySelectorAll('[data-grade-editor]').forEach((editor) => {
+  const input = editor.querySelector('[data-grade-input]');
+  const list = editor.querySelector('[data-grade-list]');
+  if (!input || !list) return;
+
+  function values() {
+    return input.value.split(/\s+/).filter((value) => /^[2-5]$/.test(value));
+  }
+
+  function sync(next) {
+    const items = (next || values()).slice(0, 5);
+    input.value = items.join(' ');
+    list.textContent = '';
+    if (!items.length) {
+      const empty = document.createElement('span');
+      empty.className = 'grade-picked-empty';
+      empty.textContent = 'нет оценок';
+      list.appendChild(empty);
+      return;
+    }
+    items.forEach((value, index) => {
+      const chip = document.createElement('span');
+      chip.className = `grade grade--${value}`;
+      chip.textContent = value;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'grade-remove';
+      remove.textContent = '×';
+      remove.title = 'Удалить оценку';
+      remove.setAttribute('aria-label', `Удалить оценку ${value}`);
+      remove.addEventListener('click', () => {
+        const current = values();
+        current.splice(index, 1);
+        sync(current);
+      });
+      chip.appendChild(remove);
+      list.appendChild(chip);
+    });
+  }
+
+  editor.querySelectorAll('[data-grade-add]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const current = values();
+      if (current.length >= 5) return;
+      current.push(button.getAttribute('data-grade-add'));
+      sync(current);
+    });
+  });
+
+  sync();
+});
+
 /* Подсказка о весе оценок */
 const typeSelect = document.querySelector('[data-lesson-type]');
 const weightHint = document.querySelector('[data-weight-hint]');

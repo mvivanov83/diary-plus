@@ -37,9 +37,11 @@ const {
   statusBadge,
   gradeChips,
   attendanceBadge,
+  initials,
   percent,
 } = require('../ui');
 const { ensureLessonsForRange } = require('../lessons');
+const { notifyGrades, notifyHomework, notifyComment, notifyTokens } = require('../notify');
 
 const router = express.Router();
 router.use(requireRole('teacher'));
@@ -290,29 +292,37 @@ router.get('/lessons/:id', loadOwnLesson, (req, res) => {
   const weight = lessonWeight(lesson.lesson_type);
 
   const attendanceOptions = students.map((student) => {
-    const current = attendanceMap.get(student.id);
+    const current = attendanceMap.get(student.id) || 'present';
+    const studentGrades = (gradesMap.get(student.id) || []).map((grade) => Number(grade.value));
     return `
       <div class="attendance-row">
         <div class="student-cell">
-          <span class="student-name">${escapeHtml(student.full_name)}</span>
-          ${current ? attendanceBadge(current) : '<span class="badge badge--muted">не отмечен</span>'}
+          <a class="student-name" href="/teacher/students/${Number(student.id)}">${escapeHtml(student.full_name)}</a>
+          ${attendanceMap.get(student.id) ? attendanceBadge(attendanceMap.get(student.id)) : '<span class="badge badge--muted">по умолчанию: был</span>'}
         </div>
         <div class="attendance-options" role="radiogroup" aria-label="Посещаемость: ${escapeHtml(student.full_name)}">
           ${[
-            ['present', 'Н', 'Присутствовал'],
-            ['absent', 'О', 'Отсутствовал'],
-            ['late', 'ОП', 'Опоздал'],
-            ['excused', 'У', 'Уважительная причина'],
+            ['present', 'Б', 'Был'],
+            ['absent', 'Н', 'Отсутствовал'],
+            ['late', 'О', 'Опоздал'],
+            ['excused', 'У', 'Уважительная'],
           ].map(([value, short, label]) => `
             <label class="att-option att-option--${value}" title="${escapeHtml(label)}">
               <input type="radio" name="att_${Number(student.id)}" value="${value}"${current === value ? ' checked' : ''}>
-              <span>${escapeHtml(short)}</span>
+              <span class="att-btn">
+                <span class="att-full">${escapeHtml(label)}</span>
+                <span class="att-short" aria-hidden="true">${escapeHtml(short)}</span>
+              </span>
             </label>`).join('')}
         </div>
-        <label class="grade-field">
+        <div class="grade-editor" data-grade-editor>
           <span class="field-label">Оценки</span>
-          <input class="grade-input" type="text" name="grades_${Number(student.id)}" value="${escapeHtml((gradesMap.get(student.id) || []).map((grade) => grade.value).join(' '))}" inputmode="numeric" placeholder="5 4" autocomplete="off">
-        </label>
+          <div class="grade-buttons" role="group" aria-label="Добавить оценку: ${escapeHtml(student.full_name)}">
+            ${[5, 4, 3, 2].map((value) => `<button type="button" class="grade-btn grade-btn--${value}" data-grade-add="${value}" title="Добавить оценку ${value}" aria-label="Добавить оценку ${value}">${value}</button>`).join('')}
+          </div>
+          <div class="grade-picked" data-grade-list aria-live="polite"></div>
+          <input type="hidden" name="grades_${Number(student.id)}" value="${escapeHtml(studentGrades.join(' '))}" data-grade-input>
+        </div>
       </div>`;
   }).join('');
 
@@ -381,7 +391,13 @@ router.get('/lessons/:id', loadOwnLesson, (req, res) => {
           <h2>Посещаемость и оценки</h2>
           <button type="button" class="btn btn-secondary btn-sm" data-mark-all>Все присутствуют</button>
         </div>
-        <p class="field-hint">Оценки: 2–5, можно несколько через пробел. У контрольной автоматически вес 2.</p>
+        <div class="attendance-legend" aria-label="Обозначения посещаемости">
+          <span><span class="legend-mark legend-mark--present">Б</span> Был (по умолчанию)</span>
+          <span><span class="legend-mark legend-mark--absent">Н</span> Отсутствовал</span>
+          <span><span class="legend-mark legend-mark--late">О</span> Опоздал</span>
+          <span><span class="legend-mark legend-mark--excused">У</span> Уважительная</span>
+        </div>
+        <p class="field-hint">Оценки: нажимайте 2 / 3 / 4 / 5 — можно поставить несколько. Крестик удаляет оценку. У контрольной автоматически вес 2.</p>
         <div class="attendance-list">${attendanceOptions || emptyState('В классе нет учеников')}</div>
       </section>
       <div class="form-sticky">
@@ -408,10 +424,8 @@ router.post('/lessons/:id', loadOwnLesson, upload.single('homework_file'), (req,
 
   const attendance = [];
   for (const student of students) {
-    const status = req.body[`att_${student.id}`];
-    if (validAttendance(status)) {
-      attendance.push({ studentId: student.id, status });
-    }
+    const rawStatus = req.body[`att_${student.id}`];
+    attendance.push({ studentId: student.id, status: validAttendance(rawStatus) ? rawStatus : 'present' });
   }
 
   let gradesByStudent;
@@ -432,6 +446,15 @@ router.post('/lessons/:id', loadOwnLesson, upload.single('homework_file'), (req,
   const homeworkOriginalName = newFile
     ? originalName
     : removeHomework ? null : lesson.homework_original_name;
+
+  const oldGrades = db.prepare('SELECT student_id, value FROM grades WHERE lesson_id = ?').all(lesson.id);
+  const oldGradesMap = new Map();
+  for (const row of oldGrades) {
+    if (!oldGradesMap.has(row.student_id)) oldGradesMap.set(row.student_id, []);
+    oldGradesMap.get(row.student_id).push(Number(row.value));
+  }
+  const oldHomework = lesson.homework_text;
+  const oldComment = lesson.parent_comment;
 
   const complete = Boolean(topic) && attendance.length === students.length;
   const now = new Date();
@@ -496,18 +519,331 @@ router.post('/lessons/:id', loadOwnLesson, upload.single('homework_file'), (req,
     removeUploaded(lesson.homework_file);
   }
 
-  return res.redirect(`/teacher/lessons/${lesson.id}?msg=${complete ? 'saved' : 'saved-draft'}`);
+  /* Уведомления родителям — только при реальном изменении данных. */
+  for (const student of students) {
+    const before = (oldGradesMap.get(student.id) || []).slice().sort().join(' ');
+    const after = (gradesByStudent.get(student.id) || []).slice().sort().join(' ');
+    if (after && before !== after) {
+      notifyGrades({
+        studentId: student.id,
+        subjectName: lesson.subject_name,
+        className: lesson.class_name,
+        date: lesson.date,
+        grades: gradesByStudent.get(student.id),
+      });
+    }
+  }
+  if (homeworkText && homeworkText !== oldHomework) {
+    notifyHomework({
+      classId: lesson.class_id,
+      subjectName: lesson.subject_name,
+      className: lesson.class_name,
+      date: lesson.date,
+      homeworkText,
+    });
+  }
+  if (parentComment && parentComment !== oldComment) {
+    notifyComment({
+      classId: lesson.class_id,
+      subjectName: lesson.subject_name,
+      className: lesson.class_name,
+      date: lesson.date,
+      comment: parentComment,
+    });
+  }
+
+  return res.redirect(`/teacher/lessons/${lesson.id}?msg=${
+    complete ? (fillStatus === 'late' ? 'saved-late' : 'saved-on-time') : 'saved-draft'
+  }`);
 });
 
 function validAttendance(status) {
   return ['present', 'absent', 'late', 'excused'].includes(status);
 }
 
+/* ─────────────────────── Ученики учителя ────────────────────── */
+
+const teacherClassIds = (teacherId) => db.prepare(`
+  SELECT class_id FROM lessons WHERE teacher_id = ?
+  UNION
+  SELECT class_id FROM schedule WHERE teacher_id = ?
+`).all(teacherId, teacherId).map((row) => row.class_id);
+
+function loadTeacherStudent(req, res, next) {
+  const id = toId(req.params.id);
+  const student = id ? db.prepare(`
+    SELECT st.id, st.full_name, st.class_id, c.name AS class_name
+    FROM students st
+    JOIN classes c ON c.id = st.class_id
+    WHERE st.id = ?
+  `).get(id) : null;
+
+  const allowed = student && teacherClassIds(req.user.id).includes(student.class_id);
+  if (!allowed) {
+    return sendError(res, 404, 'Ученик не найден', 'Ученик не существует или учится в классе, который вы не преподаёте.', req.user);
+  }
+  req.student = student;
+  return next();
+}
+
+router.get('/students', (req, res) => {
+  const rows = db.prepare(`
+    SELECT st.id, st.full_name, c.name AS class_name,
+           (SELECT SUM(g.value * g.weight) FROM grades g WHERE g.student_id = st.id) AS weight_sum,
+           (SELECT SUM(g.weight) FROM grades g WHERE g.student_id = st.id) AS weight_total,
+           (SELECT COUNT(*) FROM attendance a WHERE a.student_id = st.id) AS att_total,
+           (SELECT COUNT(*) FROM attendance a WHERE a.student_id = st.id AND a.status IN ('absent', 'excused')) AS att_missed,
+           (SELECT COALESCE(SUM(t.amount), 0) FROM tokens t WHERE t.student_id = st.id) AS token_balance
+    FROM students st
+    JOIN classes c ON c.id = st.class_id
+    WHERE st.class_id IN (
+      SELECT class_id FROM lessons WHERE teacher_id = ?
+      UNION
+      SELECT class_id FROM schedule WHERE teacher_id = ?
+    )
+    ORDER BY c.name, st.full_name
+  `).all(req.user.id, req.user.id);
+
+  const byClass = new Map();
+  for (const row of rows) {
+    if (!byClass.has(row.class_name)) byClass.set(row.class_name, []);
+    byClass.get(row.class_name).push(row);
+  }
+
+  const blocks = [...byClass.entries()].map(([className, list]) => `
+    <section class="card">
+      <div class="card-head">
+        <h2>${escapeHtml(className)}</h2>
+        <span class="card-hint">${list.length} учеников</span>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Ученик</th><th>Средний</th><th>Пропуски</th><th>Токены</th><th></th></tr></thead>
+          <tbody>
+            ${list.map((student) => {
+              const average = student.weight_total ? student.weight_sum / student.weight_total : null;
+              const missed = student.att_total ? (student.att_missed / student.att_total) * 100 : null;
+              return `<tr>
+                <td><strong><a href="/teacher/students/${Number(student.id)}">${escapeHtml(student.full_name)}</a></strong></td>
+                <td>${average === null ? '—' : escapeHtml(satisfactoryLabel(average))}</td>
+                <td>${missed === null ? '—' : escapeHtml(percent(missed))}</td>
+                <td class="${student.token_balance < 0 ? 'text-danger' : ''}">${student.token_balance > 0 ? '+' : ''}${Number(student.token_balance)}</td>
+                <td class="row-actions"><a class="btn btn-ghost btn-sm" href="/teacher/students/${Number(student.id)}">Карточка</a></td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </section>`).join('');
+
+  return render(req, res, 'Ученики', '/teacher/students', `
+    ${pageHead('Ученики', 'Карточки учеников ваших классов: оценки, посещаемость, токены и заметки')}
+    ${rows.length ? blocks : emptyState('Учеников нет', 'Администратор должен назначить вам уроки в расписании.')}`);
+});
+
+router.get('/students/:id', loadTeacherStudent, (req, res) => {
+  const student = req.student;
+
+  const gradeRows = db.prepare(`
+    SELECT s.name AS subject_name, g.value, g.weight
+    FROM grades g
+    JOIN lessons l ON l.id = g.lesson_id
+    JOIN subjects s ON s.id = l.subject_id
+    WHERE g.student_id = ?
+    ORDER BY s.name, g.id
+  `).all(student.id);
+
+  const attendanceRows = db.prepare(`
+    SELECT s.name AS subject_name, a.status
+    FROM attendance a
+    JOIN lessons l ON l.id = a.lesson_id
+    JOIN subjects s ON s.id = l.subject_id
+    WHERE a.student_id = ?
+  `).all(student.id);
+
+  const subjectMap = new Map();
+  const ensureSubject = (name) => {
+    if (!subjectMap.has(name)) subjectMap.set(name, { grades: [], attendance: [] });
+    return subjectMap.get(name);
+  };
+  for (const row of gradeRows) ensureSubject(row.subject_name).grades.push(row);
+  for (const row of attendanceRows) ensureSubject(row.subject_name).attendance.push(row);
+
+  const subjectRows = [...subjectMap.entries()].map(([subjectName, data]) => {
+    const weightSum = data.grades.reduce((sum, row) => sum + row.value * row.weight, 0);
+    const weightTotal = data.grades.reduce((sum, row) => sum + row.weight, 0);
+    const missed = data.attendance.filter((row) => row.status === 'absent' || row.status === 'excused').length;
+    return {
+      subjectName,
+      grades: data.grades,
+      average: weightTotal ? weightSum / weightTotal : null,
+      final: weightTotal ? Math.round(weightSum / weightTotal) : null,
+      missed,
+      total: data.attendance.length,
+    };
+  });
+
+  const weightSum = gradeRows.reduce((sum, row) => sum + row.value * row.weight, 0);
+  const weightTotal = gradeRows.reduce((sum, row) => sum + row.weight, 0);
+  const average = weightTotal ? weightSum / weightTotal : null;
+  const missed = attendanceRows.filter((row) => row.status === 'absent' || row.status === 'excused').length;
+  const missedPercent = attendanceRows.length ? (missed / attendanceRows.length) * 100 : null;
+
+  const tokens = db.prepare(`
+    SELECT t.id, t.amount, t.reason, t.created_at, u.full_name AS teacher_name
+    FROM tokens t
+    LEFT JOIN users u ON u.id = t.teacher_id
+    WHERE t.student_id = ?
+    ORDER BY t.created_at DESC, t.id DESC
+  `).all(student.id);
+  const balance = tokens.reduce((sum, row) => sum + row.amount, 0);
+
+  const notes = db.prepare(`
+    SELECT n.id, n.body, n.created_at, u.full_name AS teacher_name
+    FROM student_notes n
+    LEFT JOIN users u ON u.id = n.teacher_id
+    WHERE n.student_id = ?
+    ORDER BY n.created_at DESC, n.id DESC
+  `).all(student.id);
+
+  const gradesTable = subjectRows.length ? `
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Предмет</th><th>Оценки</th><th>Средний</th><th>Итог</th><th>Пропуски</th></tr></thead>
+        <tbody>
+          ${subjectRows.map((row) => `
+            <tr>
+              <td><strong>${escapeHtml(row.subjectName)}</strong></td>
+              <td>${gradeChips(row.grades)}</td>
+              <td>${row.average === null ? '—' : escapeHtml(satisfactoryLabel(row.average))}</td>
+              <td>${row.final === null ? '—' : `<span class="grade grade--${Math.min(5, Math.max(2, row.final))}">${row.final}</span>`}</td>
+              <td>${row.total ? escapeHtml(percent((row.missed / row.total) * 100)) : '—'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>` : emptyState('Оценок пока нет', 'Оценки появятся после заполнения журнала.');
+
+  return render(req, res, 'Карточка ученика', '/teacher/students', `
+    <a class="back-link" href="/teacher/students">← Ученики</a>
+    <section class="student-hero">
+      <div class="student-hero-main">
+        <span class="child-avatar">${initials(student.full_name)}</span>
+        <div>
+          <div class="eyebrow">Карточка ученика</div>
+          <h1 class="page-title">${escapeHtml(student.full_name)}</h1>
+          <p class="page-subtitle">${escapeHtml(student.class_name)} класс</p>
+        </div>
+      </div>
+      <div class="student-stats">
+        <div><span>Средний балл</span><strong>${average === null ? '—' : escapeHtml(satisfactoryLabel(average))}</strong></div>
+        <div><span>Пропуски</span><strong>${missedPercent === null ? '—' : escapeHtml(percent(missedPercent))}</strong></div>
+        <div><span>Токены</span><strong class="${balance < 0 ? 'text-danger' : ''}">${balance > 0 ? '+' : ''}${balance}</strong></div>
+      </div>
+    </section>
+    <div class="split">
+      <div>
+        <section class="card">
+          <div class="card-head"><h2>Оценки по предметам</h2><span class="card-hint">все предметы</span></div>
+          ${gradesTable}
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>История токенов</h2><span class="card-hint">баланс ${balance > 0 ? '+' : ''}${balance}</span></div>
+          ${tokens.length ? `
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th>Дата</th><th>Начисление</th><th>Причина</th><th>Учитель</th></tr></thead>
+                <tbody>
+                  ${tokens.slice(0, 50).map((token) => `
+                    <tr>
+                      <td>${escapeHtml(formatDateTimeMoscow(token.created_at))}</td>
+                      <td><strong class="${token.amount < 0 ? 'text-danger' : 'text-success'}">${token.amount > 0 ? '+' : ''}${Number(token.amount)}</strong></td>
+                      <td>${escapeHtml(token.reason)}</td>
+                      <td>${escapeHtml(token.teacher_name || '—')}</td>
+                    </tr>`).join('')}
+                </tbody>
+              </table>
+            </div>` : emptyState('Токенов пока нет', 'Начислите первый токен в форме справа.')}
+        </section>
+      </div>
+      <aside>
+        <section class="card">
+          <div class="card-head"><h2>Токены</h2></div>
+          <form method="post" action="/teacher/students/${Number(student.id)}/tokens" class="form">
+            <label class="field">
+              <span class="field-label">Действие</span>
+              <select name="direction">
+                <option value="add">Начислить</option>
+                <option value="subtract">Списать</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Количество</span>
+              <input type="number" name="amount" min="1" max="100" step="1" value="1" required>
+            </label>
+            <label class="field">
+              <span class="field-label">Причина</span>
+              <input type="text" name="reason" maxlength="200" required placeholder="Активность на уроке">
+            </label>
+            <button type="submit" class="btn btn-primary btn-block">Сохранить токены</button>
+          </form>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>Внутренние заметки</h2><span class="badge">${notes.length}</span></div>
+          <p class="field-hint">Видны только учителям и администратору. Родитель их не видит.</p>
+          <form method="post" action="/teacher/students/${Number(student.id)}/notes" class="form">
+            <label class="field">
+              <span class="field-label">Новая заметка</span>
+              <textarea name="body" rows="3" maxlength="2000" required placeholder="Наблюдения, договорённости с родителями, план поддержки"></textarea>
+            </label>
+            <button type="submit" class="btn btn-secondary btn-block">Добавить заметку</button>
+          </form>
+          <div class="note-list">
+            ${notes.length ? notes.map((note) => `
+              <article class="note-card">
+                <p>${escapeHtml(note.body)}</p>
+                <span>${escapeHtml(note.teacher_name || 'Учитель')} · ${escapeHtml(formatDateTimeMoscow(note.created_at))}</span>
+              </article>`).join('') : '<p class="muted">Заметок пока нет.</p>'}
+          </div>
+        </section>
+      </aside>
+    </div>`);
+});
+
+router.post('/students/:id/tokens', loadTeacherStudent, (req, res) => {
+  const student = req.student;
+  const direction = req.body.direction === 'subtract' ? 'subtract' : 'add';
+  const amount = Math.min(100, Math.max(1, Number.parseInt(req.body.amount, 10) || 0));
+  const reason = trimOrNull(req.body.reason);
+  const back = `/teacher/students/${student.id}`;
+
+  if (!amount || !reason) return res.redirect(`${back}?msg=invalid`);
+
+  const signed = direction === 'subtract' ? -amount : amount;
+  db.prepare('INSERT INTO tokens (student_id, teacher_id, amount, reason, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(student.id, req.user.id, signed, reason, new Date().toISOString());
+  notifyTokens({ studentId: student.id, amount: signed, reason });
+  return res.redirect(`${back}?msg=tokens-saved`);
+});
+
+router.post('/students/:id/notes', loadTeacherStudent, (req, res) => {
+  const student = req.student;
+  const body = trimOrNull(req.body.body);
+  const back = `/teacher/students/${student.id}`;
+  if (!body) return res.redirect(`${back}?msg=invalid`);
+
+  db.prepare('INSERT INTO student_notes (student_id, teacher_id, body, created_at) VALUES (?, ?, ?, ?)')
+    .run(student.id, req.user.id, body.slice(0, 2000), new Date().toISOString());
+  return res.redirect(`${back}?msg=note-saved`);
+});
+
 /* ─────────────────────── Журнал класса ──────────────────────── */
 
 router.get('/journal', (req, res) => {
   const today = todayMoscow();
-  const weeks = [4, 8, 12].includes(Number(req.query.weeks)) ? Number(req.query.weeks) : 8;
+  const periods = { week: 1, month: 4, quarter: 12 };
+  const period = Object.prototype.hasOwnProperty.call(periods, req.query.period) ? req.query.period : 'month';
+  const weeks = periods[period];
+  const periodLabel = { week: 'Неделя', month: 'Месяц', quarter: 'Четверть' }[period];
 
   const pairs = db.prepare(`
     SELECT class_id, subject_id, class_name, subject_name
@@ -621,6 +957,8 @@ router.get('/journal', (req, res) => {
       </a>
     </th>`).join('');
 
+  const averageHint = 'Средневзвешенная оценка за выбранный период: сумма(оценка × вес) / сумма весов. Контрольная работа — вес 2, остальные — вес 1.';
+
   const tableRows = students.map((student) => {
     const stats = studentStats.get(student.id);
     const cells = lessons.map((lesson) => {
@@ -634,9 +972,9 @@ router.get('/journal', (req, res) => {
     }).join('');
     return `
       <tr>
-        <th scope="row" class="student-col">${escapeHtml(student.full_name)}</th>
+        <th scope="row" class="student-col"><a href="/teacher/students/${Number(student.id)}">${escapeHtml(student.full_name)}</a></th>
         ${cells}
-        <td class="journal-result"><strong>${stats.average === null ? '—' : escapeHtml(satisfactoryLabel(stats.average))}</strong></td>
+        <td class="journal-result journal-avg-cell" title="${escapeHtml(averageHint)}"><strong>${stats.average === null ? '—' : escapeHtml(satisfactoryLabel(stats.average))}</strong></td>
         <td class="journal-result">${stats.final === null ? '—' : `<span class="grade grade--${Math.min(5, Math.max(2, stats.final))}">${stats.final}</span>`}</td>
         <td class="journal-result">${stats.missedPercent === null ? '—' : escapeHtml(percent(stats.missedPercent))}</td>
       </tr>`;
@@ -648,6 +986,14 @@ router.get('/journal', (req, res) => {
   const classMissed = attendanceRows.filter((row) => row.status === 'absent' || row.status === 'excused').length;
   const classMissedPercent = attendanceRows.length ? (classMissed / attendanceRows.length) * 100 : null;
 
+  const pairValue = `${selected.class_id}:${selected.subject_id}`;
+  const periodSwitch = `
+    <div class="period-switch" role="group" aria-label="Период журнала">
+      ${Object.keys(periods).map((key) => `
+        <a class="period-btn${period === key ? ' is-active' : ''}" href="/teacher/journal?pair=${encodeURIComponent(pairValue)}&period=${key}"${period === key ? ' aria-current="page"' : ''}>${escapeHtml({ week: 'Неделя', month: 'Месяц', quarter: 'Четверть' }[key])}</a>
+      `).join('')}
+    </div>`;
+
   const content = lessons.length ? `
     <div class="table-wrap journal-scroll">
       <table class="journal-table">
@@ -655,16 +1001,16 @@ router.get('/journal', (req, res) => {
           <tr>
             <th scope="col" class="student-col">Ученик</th>
             ${headerCells}
-            <th class="journal-result">Средний</th>
-            <th class="journal-result">Итог</th>
-            <th class="journal-result">Пропуски</th>
+            <th scope="col" class="journal-result journal-avg-head" title="${escapeHtml(averageHint)}">Средний<small>(взвешенный)</small></th>
+            <th scope="col" class="journal-result">Итог</th>
+            <th scope="col" class="journal-result">% пропусков</th>
           </tr>
         </thead>
         <tbody>${tableRows}</tbody>
         <tfoot>
           <tr>
             <th scope="row" class="student-col">Средний по классу</th>
-            <td colspan="${lessons.length}" class="journal-class-average">Взвешенное среднее по всем оценкам</td>
+            <td colspan="${lessons.length}" class="journal-class-average">Взвешенное среднее по всем оценкам за период</td>
             <td class="journal-result"><strong>${classAverage === null ? '—' : escapeHtml(satisfactoryLabel(classAverage))}</strong></td>
             <td class="journal-result">${classAverage === null ? '—' : `<span class="grade grade--${Math.min(5, Math.max(2, Math.round(classAverage)))}">${Math.round(classAverage)}</span>`}</td>
             <td class="journal-result">${classMissedPercent === null ? '—' : escapeHtml(percent(classMissedPercent))}</td>
@@ -676,12 +1022,11 @@ router.get('/journal', (req, res) => {
   const body = `
     ${pageHead('Журнал класса', 'Сетка ученики × даты · взвешенный средний балл', `
       <form method="get" action="/teacher/journal" class="inline-form">
+        <input type="hidden" name="period" value="${escapeHtml(period)}">
         <select name="pair" onchange="this.form.submit()" aria-label="Класс и предмет">${pairOptions}</select>
-        <select name="weeks" onchange="this.form.submit()" aria-label="Период">
-          ${[4, 8, 12].map((value) => `<option value="${value}"${weeks === value ? ' selected' : ''}>${value} недель</option>`).join('')}
-        </select>
         <noscript><button class="btn btn-secondary btn-sm" type="submit">Показать</button></noscript>
       </form>
+      ${periodSwitch}
     `)}
     <section class="card">
       <div class="journal-head">
@@ -689,7 +1034,7 @@ router.get('/journal', (req, res) => {
           <span class="tag tag--strong">${escapeHtml(selected.class_name)}</span>
           <span class="tag">${escapeHtml(selected.subject_name)}</span>
         </div>
-        <div class="journal-period">${escapeHtml(formatWeekRange(mondayOf(fromDate)))} — ${escapeHtml(formatWeekRange(currentMonday))}</div>
+        <div class="journal-period"><strong>${escapeHtml(periodLabel)}</strong> · ${escapeHtml(formatWeekRange(mondayOf(fromDate)))} — ${escapeHtml(formatWeekRange(currentMonday))}</div>
       </div>
       ${content}
     </section>
@@ -699,9 +1044,9 @@ router.get('/journal', (req, res) => {
       <span><span class="grade grade--3">3</span> удовлетворительно</span>
       <span><span class="grade grade--2">2</span> плохо</span>
       <span><span class="grade grade--5">5<span class="grade-weight">×2</span></span> контрольная, вес 2</span>
-      <span>О — отсутствовал, У — уважительная, ОП — опоздал</span>
+      <span>Б — был, Н — отсутствовал, О — опоздал, У — уважительная</span>
     </div>
-    <p class="page-note">Средний балл взвешенный: контрольная работа считается с весом 2. «Итог» — округление среднего до целой оценки за выбранный период.</p>`;
+    <p class="page-note">Средний (взвешенный) пересчитывается за выбранный период: сумма(оценка × вес) / сумма весов. «Месяц» — 4 учебные недели, «Четверть» — 12 недель. «Итог» — округление среднего до целой оценки, «% пропусков» — доля отсутствий и уважительных пропусков.</p>`;
   return render(req, res, 'Журнал класса', '/teacher/journal', body);
 });
 
