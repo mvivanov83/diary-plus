@@ -1,8 +1,9 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const db = require('../db');
-const { requireRole } = require('../auth');
+const { requireRole, hashPassword } = require('../auth');
 const { layout } = require('../layout');
 const {
   escapeHtml,
@@ -14,13 +15,16 @@ const {
   formatShortDate,
   lessonFillState,
   satisfactoryLabel,
+  moscowDeadline,
 } = require('../util');
 const {
   getFlash,
   pageHead,
   emptyState,
   statusBadge,
+  percent,
 } = require('../ui');
+const { notifySchedule } = require('../notify');
 
 const router = express.Router();
 router.use(requireRole('admin'));
@@ -114,11 +118,12 @@ router.get('/', (req, res) => {
   `).all();
 
   const statCards = `
-    <div class="stat-grid">
+    <div class="stat-grid stat-grid--five">
       <div class="stat"><span class="stat-label">Учеников</span><strong class="stat-value">${counts.students}</strong><span class="stat-note">в ${counts.classes} классах</span></div>
       <div class="stat"><span class="stat-label">Классов</span><strong class="stat-value">${counts.classes}</strong><span class="stat-note">5А · 6Б · 7В</span></div>
       <div class="stat"><span class="stat-label">Учителей</span><strong class="stat-value">${counts.teachers}</strong><span class="stat-note">активные аккаунты</span></div>
-      <div class="stat stat--accent"><span class="stat-label">Заявки родителей</span><strong class="stat-value">${counts.requests}</strong><span class="stat-note">на модерации</span></div>
+      <div class="stat stat--accent"><span class="stat-label">Заявки родителей</span><strong class="stat-value">${counts.requests}</strong><span class="stat-note"><a href="/admin/requests">на модерации →</a></span></div>
+      <div class="stat ${unfilled.length ? 'stat--danger' : ''}"><span class="stat-label">Незаполненные уроки</span><strong class="stat-value">${unfilled.length}</strong><span class="stat-note">сегодня и вчера</span></div>
     </div>`;
 
   const unfilledBlock = unfilled.length ? `
@@ -178,9 +183,11 @@ router.get('/', (req, res) => {
       </section>
     </div>
     <section class="card card--soft">
-      <div class="card-head"><h2>Что дальше</h2></div>
-      <p class="muted">Модерация заявок родителей и отчёт «Заполнение журнала» с CSV — следующий этап. В этап 1 входят справочники, расписание и журнал учителя.</p>
+      <div class="card-head"><h2>Управление школой</h2></div>
+      <p class="muted">Заявки родителей, отчёт по заполнению журнала и экспорт CSV для расчёта оплаты учителей — в разделе «Заявки» и «Отчёт».</p>
       <div class="quick-links">
+        <a href="/admin/requests">Заявки родителей</a>
+        <a href="/admin/reports/journal">Заполнение журнала</a>
         <a href="/admin/classes">Классы</a>
         <a href="/admin/students">Ученики</a>
         <a href="/admin/teachers">Учителя</a>
@@ -662,6 +669,272 @@ router.post('/subjects/:id/delete', (req, res) => {
   return redirectWith(res, '/admin/subjects', 'deleted');
 });
 
+/* ─────────────────────── Заявки родителей ──────────────────── */
+
+router.get('/requests', (req, res) => {
+  const pending = db.prepare(`
+    SELECT * FROM parent_requests WHERE status = 'pending' ORDER BY created_at, id
+  `).all();
+  const reviewed = db.prepare(`
+    SELECT r.*, u.full_name AS reviewer_name
+    FROM parent_requests r
+    LEFT JOIN users u ON u.id = r.reviewed_by
+    WHERE r.status != 'pending'
+    ORDER BY r.reviewed_at DESC, r.id DESC
+    LIMIT 10
+  `).all();
+  const students = db.prepare(`
+    SELECT st.id, st.full_name, c.name AS class_name
+    FROM students st
+    JOIN classes c ON c.id = st.class_id
+    ORDER BY c.name, st.full_name
+  `).all();
+  const classes = [...new Set(students.map((student) => student.class_name))];
+  const studentOptions = classes.map((className) => `
+    <optgroup label="${escapeHtml(className)}">
+      ${students.filter((student) => student.class_name === className).map((student) => `
+        <option value="${Number(student.id)}">${escapeHtml(student.full_name)}</option>`).join('')}
+    </optgroup>`).join('');
+
+  const pendingCards = pending.map((request) => `
+    <article class="request-card">
+      <div class="request-main">
+        <div class="request-top">
+          <div>
+            <h3>${escapeHtml(request.full_name)}</h3>
+            <p>${escapeHtml(request.email)}</p>
+          </div>
+          <span class="badge badge--warning">На модерации</span>
+        </div>
+        <dl class="request-facts">
+          <div><dt>Ребёнок</dt><dd>${escapeHtml(request.child_name)}</dd></div>
+          <div><dt>Класс</dt><dd>${escapeHtml(request.child_class || '—')}</dd></div>
+          <div><dt>Заявка</dt><dd>${escapeHtml(formatShortDate(String(request.created_at).slice(0, 10)))}</dd></div>
+        </dl>
+      </div>
+      <form method="post" action="/admin/requests/${Number(request.id)}" class="request-form">
+        <label class="field">
+          <span class="field-label">Привязать к ученику</span>
+          <select name="student_id">
+            <option value="">— выберите ученика —</option>
+            ${studentOptions}
+          </select>
+        </label>
+        <div class="request-actions">
+          <button class="btn btn-primary btn-sm" type="submit" name="action" value="approve">Одобрить</button>
+          <button class="btn btn-ghost btn-sm" type="submit" name="action" value="reject" formnovalidate>Отклонить</button>
+        </div>
+      </form>
+    </article>`).join('');
+
+  const reviewedRows = reviewed.length ? `
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Родитель</th><th>E-mail</th><th>Ребёнок</th><th>Статус</th><th>Проверил</th></tr></thead>
+        <tbody>
+          ${reviewed.map((request) => `
+            <tr>
+              <td>${escapeHtml(request.full_name)}</td>
+              <td>${escapeHtml(request.email)}</td>
+              <td>${escapeHtml(request.child_name)}${request.child_class ? ` · ${escapeHtml(request.child_class)}` : ''}</td>
+              <td>${request.status === 'approved' ? '<span class="badge badge--success">Одобрена</span>' : '<span class="badge badge--danger">Отклонена</span>'}</td>
+              <td>${escapeHtml(request.reviewer_name || '—')}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>` : '';
+
+  const body = `
+    ${pageHead('Заявки родителей', 'Регистрации, ожидающие проверки администратора')}
+    <div class="stat-grid stat-grid--two">
+      <div class="stat stat--accent"><span class="stat-label">На модерации</span><strong class="stat-value">${pending.length}</strong><span class="stat-note">заявок</span></div>
+      <div class="stat"><span class="stat-label">Активных родителей</span><strong class="stat-value">${db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'parent' AND status = 'active'").get().c}</strong><span class="stat-note">с доступом к дневнику</span></div>
+    </div>
+    <section class="card">
+      <div class="card-head"><h2>Ожидают проверки</h2><span class="card-hint">${pending.length}</span></div>
+      ${pendingCards || emptyState('Новых заявок нет', 'После регистрации родителя заявка появится здесь.')}
+    </section>
+    <section class="card">
+      <div class="card-head"><h2>Последние решения</h2><span class="card-hint">10 последних</span></div>
+      ${reviewedRows || '<p class="muted">Решений пока нет.</p>'}
+    </section>`;
+  return render(req, res, 'Заявки родителей', '/admin/requests', body);
+});
+
+router.post('/requests/:id', (req, res) => {
+  const id = toId(req.params.id);
+  const request = id ? db.prepare('SELECT * FROM parent_requests WHERE id = ?').get(id) : null;
+  if (!request || request.status !== 'pending') {
+    return redirectWith(res, '/admin/requests', 'request-exists');
+  }
+
+  const action = req.body.action === 'reject' ? 'reject' : 'approve';
+  const user = request.user_id
+    ? db.prepare('SELECT id, role, status FROM users WHERE id = ?').get(request.user_id)
+    : db.prepare('SELECT id, role, status FROM users WHERE email = ?').get(request.email);
+
+  if (action === 'reject') {
+    const reject = db.transaction(() => {
+      db.prepare(`
+        UPDATE parent_requests SET status = 'rejected', reviewed_at = ?, reviewed_by = ? WHERE id = ?
+      `).run(new Date().toISOString(), req.user.id, request.id);
+      if (user) {
+        const linked = db.prepare('SELECT COUNT(*) AS c FROM parent_students WHERE parent_id = ?').get(user.id).c;
+        if (!linked) db.prepare("UPDATE users SET status = 'rejected' WHERE id = ?").run(user.id);
+      }
+    });
+    reject();
+    console.log(`[diary+] Заявка родителя ${request.email} отклонена администратором.`);
+    return redirectWith(res, '/admin/requests', 'request-rejected');
+  }
+
+  const studentId = toId(req.body.student_id);
+  const student = studentId ? db.prepare('SELECT id, full_name, class_id FROM students WHERE id = ?').get(studentId) : null;
+  if (!student) return redirectWith(res, '/admin/requests', 'invalid');
+
+  let parentId = user ? user.id : null;
+  let temporaryPassword = null;
+  if (!parentId) {
+    temporaryPassword = crypto.randomBytes(6).toString('hex');
+    parentId = Number(db.prepare(`
+      INSERT INTO users (email, password_hash, role, full_name, status)
+      VALUES (?, ?, 'parent', ?, 'active')
+    `).run(request.email, hashPassword(temporaryPassword), request.full_name).lastInsertRowid);
+    console.log(`[diary+] Создан аккаунт родителя ${request.email}, временный пароль: ${temporaryPassword}`);
+  }
+
+  const approve = db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO parent_students (parent_id, student_id) VALUES (?, ?)')
+      .run(parentId, student.id);
+    db.prepare("UPDATE users SET role = 'parent', status = 'active' WHERE id = ?").run(parentId);
+    db.prepare(`
+      UPDATE parent_requests SET status = 'approved', user_id = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?
+    `).run(parentId, new Date().toISOString(), req.user.id, request.id);
+  });
+  approve();
+
+  console.log(`[diary+] Заявка родителя ${request.email} одобрена: ученик ${student.full_name}.`);
+  return redirectWith(res, '/admin/requests', 'request-approved');
+});
+
+/* ─────────────────────── Отчёт по журналу ──────────────────── */
+
+function monthRange(value) {
+  const today = todayMoscow();
+  const month = /^\d{4}-\d{2}$/.test(String(value || '')) ? String(value) : today.slice(0, 7);
+  const [year, monthNumber] = month.split('-').map(Number);
+  if (monthNumber < 1 || monthNumber > 12) return monthRange(today);
+  const start = `${month}-01`;
+  const end = new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+  return { month, start, end };
+}
+
+function buildJournalReport(value) {
+  const range = monthRange(value);
+  const teachers = db.prepare(`
+    SELECT id, full_name, email FROM users WHERE role = 'teacher' ORDER BY full_name
+  `).all();
+  const rows = db.prepare(`
+    SELECT l.id, l.date, l.filled_at, l.fill_status, l.teacher_id
+    FROM lessons l
+    WHERE l.date BETWEEN ? AND ?
+  `).all(range.start, range.end);
+
+  const stats = new Map(teachers.map((teacher) => [teacher.id, {
+    teacher,
+    total: 0,
+    onTime: 0,
+    late: 0,
+    missing: 0,
+  }]));
+
+  for (const row of rows) {
+    const state = lessonFillState(row);
+    if (state === 'pending') continue;
+    const bucket = stats.get(row.teacher_id);
+    if (!bucket) continue;
+    bucket.total += 1;
+    if (state === 'on_time') bucket.onTime += 1;
+    else if (state === 'late') bucket.late += 1;
+    else bucket.missing += 1;
+  }
+
+  return { ...range, rows: [...stats.values()] };
+}
+
+router.get('/reports/journal', (req, res) => {
+  const report = buildJournalReport(req.query.month);
+  const totals = report.rows.reduce((sum, row) => ({
+    total: sum.total + row.total,
+    onTime: sum.onTime + row.onTime,
+    late: sum.late + row.late,
+    missing: sum.missing + row.missing,
+  }), { total: 0, onTime: 0, late: 0, missing: 0 });
+
+  const tableRows = report.rows.map((row) => {
+    const onTimePercent = row.total ? (row.onTime / row.total) * 100 : null;
+    return `<tr>
+      <td><strong>${escapeHtml(row.teacher.full_name)}</strong><br><span class="muted">${escapeHtml(row.teacher.email)}</span></td>
+      <td>${row.total}</td>
+      <td>${row.onTime}</td>
+      <td>${row.late}</td>
+      <td>${row.missing}</td>
+      <td>${onTimePercent === null ? '—' : escapeHtml(percent(onTimePercent))}</td>
+    </tr>`;
+  }).join('');
+
+  const totalPercent = totals.total ? (totals.onTime / totals.total) * 100 : null;
+  const body = `
+    ${pageHead('Заполнение журнала', `Отчёт за ${report.month}: уроки, заполненные до 18:00 и с опозданием`, `
+      <form method="get" action="/admin/reports/journal" class="inline-form">
+        <label class="field-inline"><span>Месяц</span><input type="month" name="month" value="${escapeHtml(report.month)}"></label>
+        <button class="btn btn-secondary btn-sm" type="submit">Показать</button>
+      </form>
+      <a class="btn btn-primary btn-sm" href="/admin/reports/journal.csv?month=${encodeURIComponent(report.month)}">Экспорт CSV</a>
+    `)}
+    <div class="stat-grid stat-grid--four">
+      <div class="stat"><span class="stat-label">Уроков всего</span><strong class="stat-value">${totals.total}</strong><span class="stat-note">с истёкшим дедлайном</span></div>
+      <div class="stat"><span class="stat-label">Вовремя</span><strong class="stat-value text-success">${totals.onTime}</strong><span class="stat-note">до 18:00 МСК</span></div>
+      <div class="stat"><span class="stat-label">С опозданием</span><strong class="stat-value">${totals.late}</strong><span class="stat-note">после 18:00</span></div>
+      <div class="stat ${totals.missing ? 'stat--danger' : ''}"><span class="stat-label">Не заполнено</span><strong class="stat-value">${totals.missing}</strong><span class="stat-note">дедлайн прошёл</span></div>
+    </div>
+    <section class="card">
+      <div class="card-head"><h2>По учителям</h2><span class="card-hint">% вовремя: ${totalPercent === null ? '—' : escapeHtml(percent(totalPercent))}</span></div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Учитель</th><th>Уроков</th><th>Вовремя</th><th>С опозданием</th><th>Не заполнено</th><th>% вовремя</th></tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>
+    </section>
+    <p class="page-note">В отчёт попадают только уроки с истёкшим дедлайном 18:00 МСК. CSV открывается в Excel (BOM UTF-8, разделитель «;»).</p>`;
+  return render(req, res, 'Заполнение журнала', '/admin/reports/journal', body);
+});
+
+router.get('/reports/journal.csv', (req, res) => {
+  const report = buildJournalReport(req.query.month);
+  const csvEscape = (value) => `"${String(value === null || value === undefined ? '' : value).replace(/"/g, '""')}"`;
+  const lines = [
+    ['Учитель', 'E-mail', 'Уроков всего', 'Вовремя', 'С опозданием', 'Не заполнено', '% вовремя'].map(csvEscape).join(';'),
+  ];
+  for (const row of report.rows) {
+    const onTimePercent = row.total ? Math.round((row.onTime / row.total) * 100) : 0;
+    lines.push([
+      row.teacher.full_name,
+      row.teacher.email,
+      row.total,
+      row.onTime,
+      row.late,
+      row.missing,
+      `${onTimePercent}%`,
+    ].map(csvEscape).join(';'));
+  }
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="journal-report-${report.month}.csv"`);
+  return res.send(`\uFEFF${lines.join('\r\n')}\r\n`);
+});
+
 /* ─────────────────────────── Расписание ─────────────────────── */
 
 router.get('/schedule', (req, res) => {
@@ -849,6 +1122,14 @@ router.post('/schedule/save', (req, res) => {
     return redirectWith(res, back, error.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 'duplicate' : 'invalid');
   }
 
+  const className = db.prepare('SELECT name FROM classes WHERE id = ?').get(classId).name;
+  notifySchedule({
+    classId,
+    className,
+    weekStart,
+    note: id ? 'Урок изменён в расписании на неделю' : 'Добавлен урок в расписание на неделю',
+  });
+
   return redirectWith(res, back, id ? 'updated' : 'created');
 });
 
@@ -856,7 +1137,20 @@ router.post('/schedule/:id/delete', (req, res) => {
   const id = toId(req.params.id);
   const classId = toId(req.body.class_id);
   const weekStart = isValidDateString(req.body.week_start) ? req.body.week_start : todayMoscow();
+  const entry = id ? db.prepare(`
+    SELECT sc.id, sc.class_id, sc.week_start, c.name AS class_name
+    FROM schedule sc JOIN classes c ON c.id = sc.class_id
+    WHERE sc.id = ?
+  `).get(id) : null;
   if (id) db.prepare('DELETE FROM schedule WHERE id = ?').run(id);
+  if (entry) {
+    notifySchedule({
+      classId: entry.class_id,
+      className: entry.class_name,
+      weekStart: entry.week_start,
+      note: 'Урок удалён из расписания на неделю',
+    });
+  }
   return redirectWith(res, `/admin/schedule?class_id=${classId || ''}&week_start=${encodeURIComponent(weekStart)}`, 'deleted');
 });
 
@@ -897,6 +1191,14 @@ router.post('/schedule/copy', (req, res) => {
     }
   });
   copy();
+
+  const className = db.prepare('SELECT name FROM classes WHERE id = ?').get(classId).name;
+  notifySchedule({
+    classId,
+    className,
+    weekStart: nextWeek,
+    note: 'Расписание скопировано на неделю',
+  });
 
   return redirectWith(res, back, 'copied');
 });
